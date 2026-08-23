@@ -2,12 +2,22 @@ import { StatusBar } from 'expo-status-bar';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { getDocumentAsync } from 'expo-document-picker';
-import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
+import { requestNotificationPermissionsAsync, setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { convertMidiToWav, isMidiFile } from './src/midi';
 import { ensureTickSoundAsync } from './src/tickSound';
 import {
+  getNativeWorkoutSnapshot,
+  hasNativeWorkoutTimer,
+  pauseNativeWorkoutTimer,
+  resetNativeWorkoutTimer,
+  resumeNativeWorkoutTimer,
+  skipNativeWorkoutStage,
+  startNativeWorkoutTimer,
+} from './src/nativeWorkoutTimer';
+import {
   Alert,
+  AppState,
   BackHandler,
   KeyboardAvoidingView,
   Modal,
@@ -501,20 +511,23 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   const [remaining, setRemaining] = useState(plan.stages[0]?.durationSec ?? 0);
   const [speechActive, setSpeechActive] = useState(false);
   const [tickUri, setTickUri] = useState<string | null>(null);
+  const [nativeTimerEnabled, setNativeTimerEnabled] = useState(hasNativeWorkoutTimer);
   const endAtRef = useRef(0);
+  const statusRef = useRef(status);
+  const stageIndexRef = useRef(0);
   const speechTokenRef = useRef(0);
-  const speechActiveRef = useRef(false);
   const musicUri = plan.music?.uri ?? null;
   const musicVolume = clampMusicVolume(plan.music?.volume ?? DEFAULT_MUSIC_VOLUME);
   const player = useAudioPlayer(musicUri, { updateInterval: 500, keepAudioSessionActive: true });
-  const tickPlayer = useAudioPlayer(tickUri, { keepAudioSessionActive: true });
+  const tickPlayer = useAudioPlayer(tickUri, { updateInterval: 500, keepAudioSessionActive: true });
+  const playerStatus = useAudioPlayerStatus(player);
+  const tickPlayerStatus = useAudioPlayerStatus(tickPlayer);
   const currentStage = plan.stages[stageIndex];
   const total = planDuration(plan);
   const completedBefore = plan.stages.slice(0, stageIndex).reduce((sum, stage) => sum + stage.durationSec, 0);
   const progress = Math.min(1, total === 0 ? 0 : (completedBefore + currentStage.durationSec - remaining) / total);
 
   const setSpeechActiveState = useCallback((active: boolean) => {
-    speechActiveRef.current = active;
     setSpeechActive(active);
   }, []);
 
@@ -550,6 +563,57 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     if (settings.vibrationEnabled) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   }, [setSpeechActiveState, settings.vibrationEnabled, settings.voiceEnabled, stopSpeech]);
 
+  const setWorkoutStatus = useCallback((nextStatus: 'idle' | 'running' | 'paused' | 'complete') => {
+    statusRef.current = nextStatus;
+    setStatus(nextStatus);
+  }, []);
+
+  const syncWorkoutClock = useCallback(() => {
+    if (statusRef.current !== 'running') return;
+
+    const now = Date.now();
+    let nextStageIndex = stageIndexRef.current;
+    let nextEndAt = endAtRef.current;
+
+    while (now >= nextEndAt && nextStageIndex < plan.stages.length - 1) {
+      nextStageIndex += 1;
+      nextEndAt += plan.stages[nextStageIndex].durationSec * 1000;
+    }
+
+    if (now >= nextEndAt) {
+      setRemaining(0);
+      setWorkoutStatus('complete');
+      announce('训练完成，做得很好！');
+      return;
+    }
+
+    endAtRef.current = nextEndAt;
+    setRemaining(Math.max(0, Math.ceil((nextEndAt - now) / 1000)));
+
+    if (nextStageIndex !== stageIndexRef.current) {
+      stageIndexRef.current = nextStageIndex;
+      setStageIndex(nextStageIndex);
+      const nextStage = plan.stages[nextStageIndex];
+      announce(`接下来，${nextStage.name}。${nextStage.cue ?? ''}`);
+    }
+  }, [announce, plan.stages, setWorkoutStatus]);
+
+  const syncNativeWorkoutClock = useCallback(async () => {
+    if (!nativeTimerEnabled) return;
+    try {
+      const snapshot = await getNativeWorkoutSnapshot();
+      if (!snapshot || snapshot.planId !== plan.id || (!snapshot.active && snapshot.status !== 'complete')) return;
+      const nextStageIndex = Math.min(Math.max(0, snapshot.stageIndex), plan.stages.length - 1);
+      stageIndexRef.current = nextStageIndex;
+      setStageIndex(nextStageIndex);
+      setRemaining(snapshot.remaining);
+      if (snapshot.status === 'running') endAtRef.current = Date.now() + snapshot.remaining * 1000;
+      setWorkoutStatus(snapshot.status);
+    } catch {
+      setNativeTimerEnabled(false);
+    }
+  }, [nativeTimerEnabled, plan.id, plan.stages.length, setWorkoutStatus]);
+
   useEffect(() => {
     void setAudioModeAsync({ playsInSilentMode: true, interruptionMode: 'doNotMix', shouldPlayInBackground: true });
     void ensureTickSoundAsync().then(setTickUri).catch(() => setTickUri(null));
@@ -558,13 +622,14 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
 
   useEffect(() => {
     if (!musicUri) return;
+    player.loop = true;
     if (status === 'running') {
-      player.setActiveForLockScreen(true, { title: plan.title, artist: '节奏伴侣' }, { showSeekForward: false, showSeekBackward: false });
+      player.setActiveForLockScreen(true, { title: currentStage.name, artist: plan.title }, { showSeekForward: false, showSeekBackward: false });
       player.play();
     } else {
       player.pause();
     }
-  }, [musicUri, plan.title, player, status]);
+  }, [currentStage.name, musicUri, plan.title, player, status]);
 
   useEffect(() => {
     if (!musicUri) return;
@@ -572,80 +637,112 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   }, [musicUri, musicVolume, player, speechActive]);
 
   useEffect(() => {
-    tickPlayer.volume = 1;
+    tickPlayer.volume = speechActive ? 0 : 1;
     tickPlayer.loop = true;
-    const shouldRunTick = status === 'running' && !musicUri && Boolean(tickUri) && !speechActive;
+    const shouldRunTick = status === 'running' && !musicUri && Boolean(tickUri);
     if (!shouldRunTick) {
       tickPlayer.pause();
       if (tickUri) tickPlayer.setActiveForLockScreen(false);
       return undefined;
     }
-    tickPlayer.setActiveForLockScreen(true, { title: plan.title, artist: '节奏伴侣' }, { showSeekForward: false, showSeekBackward: false });
-    const tickStartTimer = setTimeout(() => {
-      if (speechActiveRef.current || status !== 'running') return;
-      void tickPlayer.seekTo(0).then(() => {
-        if (!speechActiveRef.current && status === 'running') tickPlayer.play();
-      }).catch(() => undefined);
-    }, 1000);
-    return () => clearTimeout(tickStartTimer);
-  }, [musicUri, plan.title, speechActive, status, tickPlayer, tickUri]);
+    tickPlayer.setActiveForLockScreen(true, { title: currentStage.name, artist: plan.title }, { showSeekForward: false, showSeekBackward: false });
+    if (!tickPlayer.playing) tickPlayer.play();
+    return undefined;
+  }, [currentStage.name, musicUri, plan.title, speechActive, status, tickPlayer, tickUri]);
 
   useEffect(() => {
-    if (status !== 'running') return undefined;
-    const timer = setInterval(() => {
-      const nextRemaining = Math.max(0, Math.ceil((endAtRef.current - Date.now()) / 1000));
-      setRemaining(nextRemaining);
-      if (nextRemaining > 0) return;
-      if (stageIndex < plan.stages.length - 1) {
-        const nextStage = plan.stages[stageIndex + 1];
-        setStageIndex((current) => current + 1);
-        setRemaining(nextStage.durationSec);
-        endAtRef.current = Date.now() + nextStage.durationSec * 1000;
-        announce(`接下来，${nextStage.name}。${nextStage.cue ?? ''}`);
-      } else {
-        setStatus('complete');
-        announce('训练完成，做得很好！');
-      }
-    }, 250);
+    if (nativeTimerEnabled || status !== 'running') return undefined;
+    const timer = setInterval(syncWorkoutClock, 250);
     return () => clearInterval(timer);
-  }, [announce, plan.stages, stageIndex, status]);
+  }, [nativeTimerEnabled, status, syncWorkoutClock]);
 
-  const start = () => {
+  useEffect(() => {
+    if (!nativeTimerEnabled) return undefined;
+    void syncNativeWorkoutClock();
+    if (status === 'idle' || status === 'complete') return undefined;
+    const timer = setInterval(() => void syncNativeWorkoutClock(), 500);
+    return () => clearInterval(timer);
+  }, [nativeTimerEnabled, status, syncNativeWorkoutClock]);
+
+  const audioHeartbeat = musicUri ? playerStatus.currentTime : tickPlayerStatus.currentTime;
+
+  useEffect(() => {
+    if (!nativeTimerEnabled) syncWorkoutClock();
+  }, [audioHeartbeat, nativeTimerEnabled, syncWorkoutClock]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState !== 'active') return;
+      if (nativeTimerEnabled) void syncNativeWorkoutClock();
+      else syncWorkoutClock();
+    });
+    return () => subscription.remove();
+  }, [nativeTimerEnabled, syncNativeWorkoutClock, syncWorkoutClock]);
+
+  const start = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        await requestNotificationPermissionsAsync();
+      } catch {
+        // Notification controls are optional; the workout still starts if permission is unavailable.
+      }
+    }
     endAtRef.current = Date.now() + remaining * 1000;
-    setStatus('running');
-    announce(`开始${currentStage.name}，${currentStage.cue ?? ''}`);
+    setWorkoutStatus('running');
+    if (nativeTimerEnabled) {
+      void startNativeWorkoutTimer(plan, stageIndexRef.current, remaining, settings).catch(() => {
+        setNativeTimerEnabled(false);
+        announce(`开始${currentStage.name}，${currentStage.cue ?? ''}`);
+      });
+    } else {
+      announce(`开始${currentStage.name}，${currentStage.cue ?? ''}`);
+    }
   };
 
   const pause = () => {
     setRemaining(Math.max(0, Math.ceil((endAtRef.current - Date.now()) / 1000)));
-    setStatus('paused');
+    setWorkoutStatus('paused');
     stopSpeech();
+    if (nativeTimerEnabled) void pauseNativeWorkoutTimer();
   };
 
   const resume = () => {
     endAtRef.current = Date.now() + remaining * 1000;
-    setStatus('running');
+    setWorkoutStatus('running');
+    if (nativeTimerEnabled) void resumeNativeWorkoutTimer();
   };
 
   const skip = () => {
-    if (stageIndex < plan.stages.length - 1) {
-      const nextStage = plan.stages[stageIndex + 1];
-      setStageIndex((current) => current + 1);
+    if (stageIndexRef.current < plan.stages.length - 1) {
+      const nextStageIndex = stageIndexRef.current + 1;
+      const nextStage = plan.stages[nextStageIndex];
+      stageIndexRef.current = nextStageIndex;
+      setStageIndex(nextStageIndex);
       setRemaining(nextStage.durationSec);
       endAtRef.current = Date.now() + nextStage.durationSec * 1000;
-      announce(`跳到${nextStage.name}。${nextStage.cue ?? ''}`);
+      if (nativeTimerEnabled) void skipNativeWorkoutStage();
+      else announce(`跳到${nextStage.name}。${nextStage.cue ?? ''}`);
       return;
     }
-    setStatus('complete');
+    setWorkoutStatus('complete');
     setRemaining(0);
-    announce('训练完成，做得很好！');
+    if (nativeTimerEnabled) void skipNativeWorkoutStage();
+    else announce('训练完成，做得很好！');
   };
 
   const reset = () => {
-    setStatus('idle');
+    setWorkoutStatus('idle');
+    stageIndexRef.current = 0;
     setStageIndex(0);
     setRemaining(plan.stages[0]?.durationSec ?? 0);
     stopSpeech();
+    if (nativeTimerEnabled) void resetNativeWorkoutTimer();
+  };
+
+  const exitWorkout = () => {
+    if (nativeTimerEnabled) void resetNativeWorkoutTimer();
+    stopSpeech();
+    onBack();
   };
 
   if (status === 'complete') {
@@ -656,7 +753,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
           <Text style={styles.completeTitle}>训练完成</Text>
           <Text style={styles.completeSubtitle}>今天的节奏掌握得很棒，休息一下吧。</Text>
           <View style={styles.completeStats}><Text style={styles.completeStatsValue}>{formatDuration(total)}</Text><Text style={styles.completeStatsLabel}>本次训练</Text></View>
-          <Pressable style={styles.primaryButtonLarge} onPress={onBack}><Text style={styles.primaryButtonLargeText}>回到首页</Text><Text style={styles.primaryButtonLargeArrow}>→</Text></Pressable>
+          <Pressable style={styles.primaryButtonLarge} onPress={exitWorkout}><Text style={styles.primaryButtonLargeText}>回到首页</Text><Text style={styles.primaryButtonLargeArrow}>→</Text></Pressable>
           <Pressable style={styles.secondaryButton} onPress={reset}><Text style={styles.secondaryButtonText}>再来一次</Text></Pressable>
         </View>
       </View>
@@ -666,7 +763,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   return (
     <View style={styles.workoutPage}>
       <View style={styles.workoutTopBar}>
-        <Pressable style={styles.workoutBack} onPress={onBack}><Text style={styles.workoutBackText}>‹</Text><Text style={styles.workoutBackLabel}>退出训练</Text></Pressable>
+        <Pressable style={styles.workoutBack} onPress={exitWorkout}><Text style={styles.workoutBackText}>‹</Text><Text style={styles.workoutBackLabel}>退出训练</Text></Pressable>
         <Text style={styles.workoutPlanTitle}>{plan.title}</Text>
         <Pressable style={styles.workoutSettings} onPress={onSettings}><Text>⚙</Text></Pressable>
       </View>
@@ -705,7 +802,7 @@ function SettingsScreen({ settings, onBack, onChange }: { settings: Settings; on
           <SettingRow icon="📳" title="震动提醒" description="阶段切换时轻轻震动" value={settings.vibrationEnabled} onValueChange={(value) => onChange('vibrationEnabled', value)} />
           <SettingRow icon="Aa" title="大字体模式" description="让运动界面的数字更醒目" value={settings.largeText} onValueChange={(value) => onChange('largeText', value)} last />
         </View>
-        <View style={styles.aboutCard}><Text style={styles.aboutEmoji}>🌿</Text><View style={styles.aboutCopy}><Text style={styles.aboutTitle}>节奏伴侣 1.0.1</Text><Text style={styles.aboutText}>为家人设计的简单运动计时器。数据只保存在这台手机上。</Text></View></View>
+        <View style={styles.aboutCard}><Text style={styles.aboutEmoji}>🌿</Text><View style={styles.aboutCopy}><Text style={styles.aboutTitle}>节奏伴侣 1.0.2</Text><Text style={styles.aboutText}>为家人设计的简单运动计时器。数据只保存在这台手机上。</Text></View></View>
       </ScrollView>
     </ScreenContainer>
   );
