@@ -23,7 +23,9 @@ class RhythmWorkoutTimerModule : Module() {
           WorkoutStage(
             name = stage["name"] as? String ?: "当前阶段",
             cue = stage["cue"] as? String ?: "",
-            durationMs = durationSeconds.coerceAtLeast(1) * 1_000
+            durationMs = durationSeconds.coerceAtLeast(1) * 1_000,
+            musicName = (stage["musicName"] as? String)?.takeIf(String::isNotBlank),
+            musicUri = (stage["musicUri"] as? String)?.takeIf(String::isNotBlank)
           )
         }
         .orEmpty()
@@ -40,7 +42,10 @@ class RhythmWorkoutTimerModule : Module() {
         stageIndex = stageIndex,
         remainingMs = remainingMs,
         voiceEnabled = config["voiceEnabled"] as? Boolean ?: true,
-        vibrationEnabled = config["vibrationEnabled"] as? Boolean ?: true
+        vibrationEnabled = config["vibrationEnabled"] as? Boolean ?: true,
+        voiceVolume = ((config["voiceVolume"] as? Number)?.toFloat() ?: 1f).coerceIn(0f, 1f),
+        musicVolume = ((config["musicVolume"] as? Number)?.toFloat() ?: 0.7f).coerceIn(0f, 1f),
+        tickUri = (config["tickUri"] as? String)?.takeIf(String::isNotBlank)
       )
       ContextCompat.startForegroundService(context, intent)
     }

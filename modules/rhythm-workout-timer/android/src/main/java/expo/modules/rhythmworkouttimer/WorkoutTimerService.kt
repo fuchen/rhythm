@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -19,6 +21,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -27,7 +30,13 @@ import java.util.UUID
 import kotlin.math.ceil
 import kotlin.math.max
 
-data class WorkoutStage(val name: String, val cue: String, val durationMs: Long)
+data class WorkoutStage(
+  val name: String,
+  val cue: String,
+  val durationMs: Long,
+  val musicName: String?,
+  val musicUri: String?
+)
 
 internal data class StoredWorkout(
   val planId: String,
@@ -38,7 +47,10 @@ internal data class StoredWorkout(
   val endAtElapsed: Long,
   val remainingMs: Long,
   val voiceEnabled: Boolean,
-  val vibrationEnabled: Boolean
+  val vibrationEnabled: Boolean,
+  val voiceVolume: Float,
+  val musicVolume: Float,
+  val tickUri: String?
 )
 
 internal object WorkoutTimerState {
@@ -52,6 +64,8 @@ internal object WorkoutTimerState {
           put("name", stage.name)
           put("cue", stage.cue)
           put("durationMs", stage.durationMs)
+          put("musicName", stage.musicName ?: JSONObject.NULL)
+          put("musicUri", stage.musicUri ?: JSONObject.NULL)
         })
       }
     }
@@ -65,6 +79,9 @@ internal object WorkoutTimerState {
       put("remainingMs", workout.remainingMs)
       put("voiceEnabled", workout.voiceEnabled)
       put("vibrationEnabled", workout.vibrationEnabled)
+      put("voiceVolume", workout.voiceVolume.toDouble())
+      put("musicVolume", workout.musicVolume.toDouble())
+      put("tickUri", workout.tickUri ?: JSONObject.NULL)
     }
     context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
       .edit()
@@ -81,7 +98,13 @@ internal object WorkoutTimerState {
       val stages = buildList {
         for (index in 0 until rawStages.length()) {
           val stage = rawStages.getJSONObject(index)
-          add(WorkoutStage(stage.getString("name"), stage.optString("cue"), stage.getLong("durationMs")))
+          add(WorkoutStage(
+            name = stage.getString("name"),
+            cue = stage.optString("cue"),
+            durationMs = stage.getLong("durationMs"),
+            musicName = stage.optNullableString("musicName"),
+            musicUri = stage.optNullableString("musicUri")
+          ))
         }
       }
       StoredWorkout(
@@ -93,7 +116,10 @@ internal object WorkoutTimerState {
         endAtElapsed = state.optLong("endAtElapsed"),
         remainingMs = state.optLong("remainingMs"),
         voiceEnabled = state.optBoolean("voiceEnabled", true),
-        vibrationEnabled = state.optBoolean("vibrationEnabled", true)
+        vibrationEnabled = state.optBoolean("vibrationEnabled", true),
+        voiceVolume = state.optDouble("voiceVolume", 1.0).toFloat().coerceIn(0f, 1f),
+        musicVolume = state.optDouble("musicVolume", 0.7).toFloat().coerceIn(0f, 1f),
+        tickUri = state.optNullableString("tickUri")
       )
     }.getOrNull()
   }
@@ -119,16 +145,32 @@ internal object WorkoutTimerState {
       "planId" to workout.planId
     )
   }
+
+  private fun JSONObject.optNullableString(key: String): String? =
+    takeIf { has(key) && !isNull(key) }
+      ?.optString(key)
+      ?.takeIf(String::isNotBlank)
 }
 
 class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
+  private data class PendingSpeech(val message: String, val stageIndexToPlay: Int?)
+
   private val handler = Handler(Looper.getMainLooper())
   private val boundaryRunnable = Runnable { advanceAtBoundary() }
   private var workout: StoredWorkout? = null
   private var wakeLock: PowerManager.WakeLock? = null
   private var textToSpeech: TextToSpeech? = null
   private var textToSpeechReady = false
-  private var pendingSpeech: String? = null
+  private var textToSpeechUnavailable = false
+  private var pendingSpeech: PendingSpeech? = null
+  private var activeSpeechId: String? = null
+  private var activeSpeechStageIndex: Int? = null
+  private var mediaPlayer: MediaPlayer? = null
+  private var mediaPlayerStageIndex: Int? = null
+  private var mediaPlayerUsesStageMusic = false
+  private var mediaPlayerPrepared = false
+  private var stageIntroPending = false
+  private var replayIntroOnResume = false
 
   override fun onCreate() {
     super.onCreate()
@@ -151,12 +193,41 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onInit(status: Int) {
-    if (status != TextToSpeech.SUCCESS) return
+    if (status != TextToSpeech.SUCCESS) {
+      textToSpeechUnavailable = true
+      val delayedSpeech = pendingSpeech
+      pendingSpeech = null
+      delayedSpeech?.stageIndexToPlay?.let { stageIndex ->
+        stageIntroPending = false
+        playPreparedStageAudio(stageIndex)
+      }
+      return
+    }
     textToSpeechReady = true
     textToSpeech?.language = Locale.SIMPLIFIED_CHINESE
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
       textToSpeech?.setAudioAttributes(speechAudioAttributes())
     }
+    textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+      override fun onStart(utteranceId: String) = Unit
+
+      override fun onDone(utteranceId: String) {
+        handler.post { finishSpeech(utteranceId, shouldStartStageAudio = true) }
+      }
+
+      @Deprecated("Deprecated in Java")
+      override fun onError(utteranceId: String) {
+        handler.post { finishSpeech(utteranceId, shouldStartStageAudio = true) }
+      }
+
+      override fun onError(utteranceId: String, errorCode: Int) {
+        handler.post { finishSpeech(utteranceId, shouldStartStageAudio = true) }
+      }
+
+      override fun onStop(utteranceId: String, interrupted: Boolean) {
+        handler.post { finishSpeech(utteranceId, shouldStartStageAudio = workout?.status == "running") }
+      }
+    })
     pendingSpeech?.let(::speak)
     pendingSpeech = null
   }
@@ -164,6 +235,8 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
   override fun onDestroy() {
     handler.removeCallbacksAndMessages(null)
     releaseWakeLock()
+    releaseMediaPlayer()
+    clearSpeech()
     textToSpeech?.stop()
     textToSpeech?.shutdown()
     textToSpeech = null
@@ -174,9 +247,19 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
   private fun startWorkout(intent: Intent) {
     val names = intent.getStringArrayListExtra(EXTRA_STAGE_NAMES).orEmpty()
     val cues = intent.getStringArrayListExtra(EXTRA_STAGE_CUES).orEmpty()
+    val musicNames = intent.getStringArrayListExtra(EXTRA_STAGE_MUSIC_NAMES).orEmpty()
+    val musicUris = intent.getStringArrayListExtra(EXTRA_STAGE_MUSIC_URIS).orEmpty()
     val durations = intent.getLongArrayExtra(EXTRA_STAGE_DURATIONS) ?: longArrayOf()
     val stages = names.mapIndexedNotNull { index, name ->
-      durations.getOrNull(index)?.let { duration -> WorkoutStage(name, cues.getOrNull(index).orEmpty(), duration) }
+      durations.getOrNull(index)?.let { duration ->
+        WorkoutStage(
+          name = name,
+          cue = cues.getOrNull(index).orEmpty(),
+          durationMs = duration,
+          musicName = musicNames.getOrNull(index)?.takeIf(String::isNotBlank),
+          musicUri = musicUris.getOrNull(index)?.takeIf(String::isNotBlank)
+        )
+      }
     }
     if (stages.isEmpty()) {
       stopSelf()
@@ -194,10 +277,13 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
       endAtElapsed = SystemClock.elapsedRealtime() + remainingMs,
       remainingMs = remainingMs,
       voiceEnabled = intent.getBooleanExtra(EXTRA_VOICE_ENABLED, true),
-      vibrationEnabled = intent.getBooleanExtra(EXTRA_VIBRATION_ENABLED, true)
+      vibrationEnabled = intent.getBooleanExtra(EXTRA_VIBRATION_ENABLED, true),
+      voiceVolume = intent.getFloatExtra(EXTRA_VOICE_VOLUME, 1f).coerceIn(0f, 1f),
+      musicVolume = intent.getFloatExtra(EXTRA_MUSIC_VOLUME, 0.7f).coerceIn(0f, 1f),
+      tickUri = intent.getStringExtra(EXTRA_TICK_URI)?.takeIf(String::isNotBlank)
     )
     persistAndNotify()
-    signalStage("开始${stages[stageIndex].name}，${stages[stageIndex].cue}")
+    beginStage(stageIndex, "开始${stages[stageIndex].name}，${stages[stageIndex].cue}")
     scheduleBoundary()
   }
 
@@ -213,7 +299,14 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     workout = restored
     startForeground(NOTIFICATION_ID, buildNotification(restored))
     if (restored.status == "running") {
+      val restoredStageIndex = restored.stageIndex
       advanceAtBoundary()
+      workout?.takeIf { it.status == "running" && it.stageIndex == restoredStageIndex }?.let { current ->
+        val stage = current.stages[current.stageIndex]
+        beginStage(current.stageIndex, "继续${stage.name}，${stage.cue}")
+      }
+    } else {
+      replayIntroOnResume = true
     }
   }
 
@@ -222,10 +315,12 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     if (current.status != "running") return
     val remainingMs = max(0, current.endAtElapsed - SystemClock.elapsedRealtime())
     workout = current.copy(status = "paused", remainingMs = remainingMs)
+    replayIntroOnResume = stageIntroPending
+    interruptSpeech()
+    pauseStageAudio()
     handler.removeCallbacks(boundaryRunnable)
     releaseWakeLock()
     persistAndNotify()
-    controlBackgroundAudio(EXPO_AUDIO_ACTION_PAUSE)
   }
 
   private fun resumeWorkout() {
@@ -236,7 +331,12 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
       endAtElapsed = SystemClock.elapsedRealtime() + current.remainingMs.coerceAtLeast(1_000)
     )
     persistAndNotify()
-    controlBackgroundAudio(EXPO_AUDIO_ACTION_PLAY)
+    if (replayIntroOnResume) {
+      val stage = current.stages[current.stageIndex]
+      beginStage(current.stageIndex, "继续${stage.name}，${stage.cue}")
+    } else {
+      playPreparedStageAudio(current.stageIndex)
+    }
     scheduleBoundary()
   }
 
@@ -255,18 +355,21 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
       remainingMs = nextStage.durationMs
     )
     persistAndNotify()
-    signalStage("跳到${nextStage.name}。${nextStage.cue}")
-    if (current.status == "running") scheduleBoundary()
+    if (current.status == "running") {
+      beginStage(nextIndex, "跳到${nextStage.name}。${nextStage.cue}")
+      scheduleBoundary()
+    } else {
+      stopStageSequence()
+      replayIntroOnResume = true
+    }
   }
 
   private fun stopWorkout() {
     handler.removeCallbacksAndMessages(null)
     releaseWakeLock()
+    stopStageSequence()
     val current = workout ?: WorkoutTimerState.load(this)
     current?.let { WorkoutTimerState.save(this, it.copy(status = "idle", remainingMs = 0)) }
-    if (current?.status == "running" || current?.status == "paused") {
-      controlBackgroundAudio(EXPO_AUDIO_ACTION_PAUSE)
-    }
     stopForeground(STOP_FOREGROUND_REMOVE)
     stopSelf()
   }
@@ -295,7 +398,7 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     val nextStage = current.stages[nextIndex]
     workout = current.copy(stageIndex = nextIndex, endAtElapsed = nextEndAt, remainingMs = nextStage.durationMs)
     persistAndNotify()
-    signalStage("接下来，${nextStage.name}。${nextStage.cue}")
+    beginStage(nextIndex, "接下来，${nextStage.name}。${nextStage.cue}")
     scheduleBoundary()
   }
 
@@ -303,10 +406,10 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     val current = workout ?: return
     handler.removeCallbacks(boundaryRunnable)
     releaseWakeLock()
+    stopStageSequence()
     workout = current.copy(status = "complete", remainingMs = 0)
     persistAndNotify()
-    controlBackgroundAudio(EXPO_AUDIO_ACTION_PAUSE)
-    signalStage("训练完成，做得很好！")
+    announceOnly("训练完成，做得很好！")
     stopForeground(STOP_FOREGROUND_DETACH)
     handler.postDelayed({ stopSelf() }, 15_000)
   }
@@ -326,17 +429,160 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     handler.postDelayed(boundaryRunnable, delayMs)
   }
 
-  private fun signalStage(message: String) {
+  private fun beginStage(stageIndex: Int, message: String) {
     val current = workout ?: return
+    stopStageSequence()
+    replayIntroOnResume = false
+    stageIntroPending = current.voiceEnabled
+    prepareStageAudio(stageIndex, useStageMusic = true)
     if (current.vibrationEnabled) vibrate()
     if (current.voiceEnabled) {
-      if (textToSpeechReady) speak(message) else pendingSpeech = message
+      speakOrDelay(PendingSpeech(message, stageIndex))
+    } else {
+      stageIntroPending = false
+      playPreparedStageAudio(stageIndex)
     }
   }
 
-  private fun speak(message: String) {
-    val parameters = Bundle().apply { putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f) }
-    textToSpeech?.speak(message, TextToSpeech.QUEUE_FLUSH, parameters, UUID.randomUUID().toString())
+  private fun announceOnly(message: String) {
+    val current = workout ?: return
+    interruptSpeech()
+    if (current.vibrationEnabled) vibrate()
+    if (current.voiceEnabled) speakOrDelay(PendingSpeech(message, null))
+  }
+
+  private fun speakOrDelay(speech: PendingSpeech) {
+    if (textToSpeechUnavailable) {
+      speech.stageIndexToPlay?.let { stageIndex ->
+        stageIntroPending = false
+        playPreparedStageAudio(stageIndex)
+      }
+    } else if (textToSpeechReady) {
+      speak(speech)
+    } else {
+      pendingSpeech = speech
+    }
+  }
+
+  private fun speak(speech: PendingSpeech) {
+    val current = workout ?: return
+    val utteranceId = UUID.randomUUID().toString()
+    activeSpeechId = utteranceId
+    activeSpeechStageIndex = speech.stageIndexToPlay
+    val parameters = Bundle().apply {
+      putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, current.voiceVolume.coerceIn(0f, 1f))
+    }
+    val result = textToSpeech?.speak(speech.message, TextToSpeech.QUEUE_FLUSH, parameters, utteranceId)
+    if (result == TextToSpeech.ERROR) finishSpeech(utteranceId, shouldStartStageAudio = true)
+  }
+
+  private fun finishSpeech(utteranceId: String, shouldStartStageAudio: Boolean) {
+    if (activeSpeechId != utteranceId) return
+    val stageIndexToPlay = activeSpeechStageIndex
+    clearSpeech()
+    if (stageIndexToPlay == null) return
+    stageIntroPending = false
+    val current = workout ?: return
+    if (shouldStartStageAudio && current.status == "running" && current.stageIndex == stageIndexToPlay) {
+      playPreparedStageAudio(stageIndexToPlay)
+    } else if (current.status == "paused" && current.stageIndex == stageIndexToPlay) {
+      replayIntroOnResume = true
+    }
+  }
+
+  private fun prepareStageAudio(stageIndex: Int, useStageMusic: Boolean) {
+    val current = workout ?: return
+    val stage = current.stages.getOrNull(stageIndex) ?: return
+    val selectedMusicUri = stage.musicUri?.takeIf(String::isNotBlank)
+    val useSelectedMusic = useStageMusic && selectedMusicUri != null
+    val sourceUri = if (useSelectedMusic) selectedMusicUri else current.tickUri?.takeIf(String::isNotBlank)
+
+    releaseMediaPlayer()
+    if (sourceUri == null) return
+
+    val nextPlayer = MediaPlayer()
+    mediaPlayer = nextPlayer
+    mediaPlayerStageIndex = stageIndex
+    mediaPlayerUsesStageMusic = useSelectedMusic
+    mediaPlayerPrepared = false
+    try {
+      nextPlayer.setAudioAttributes(playbackAudioAttributes())
+      nextPlayer.isLooping = true
+      val volume = if (useSelectedMusic) current.musicVolume.coerceIn(0f, 1f) else 1f
+      nextPlayer.setVolume(volume, volume)
+      nextPlayer.setOnPreparedListener { preparedPlayer ->
+        if (mediaPlayer !== preparedPlayer || mediaPlayerStageIndex != stageIndex) return@setOnPreparedListener
+        mediaPlayerPrepared = true
+        playPreparedStageAudio(stageIndex)
+      }
+      nextPlayer.setOnErrorListener { failedPlayer, _, _ ->
+        handler.post {
+          if (mediaPlayer === failedPlayer && mediaPlayerStageIndex == stageIndex) {
+            releaseMediaPlayer()
+            if (useSelectedMusic) prepareStageAudio(stageIndex, useStageMusic = false)
+          }
+        }
+        true
+      }
+      nextPlayer.setDataSource(this, Uri.parse(sourceUri))
+      nextPlayer.prepareAsync()
+    } catch (_: Exception) {
+      if (mediaPlayer === nextPlayer) releaseMediaPlayer() else runCatching { nextPlayer.release() }
+      if (useSelectedMusic) prepareStageAudio(stageIndex, useStageMusic = false)
+    }
+  }
+
+  private fun playPreparedStageAudio(stageIndex: Int) {
+    val current = workout ?: return
+    if (current.status != "running" || current.stageIndex != stageIndex || stageIntroPending) return
+    if (mediaPlayerStageIndex != stageIndex || mediaPlayer == null) {
+      prepareStageAudio(stageIndex, useStageMusic = true)
+      return
+    }
+    if (!mediaPlayerPrepared) return
+    try {
+      mediaPlayer?.start()
+    } catch (_: IllegalStateException) {
+      val shouldFallbackToTick = mediaPlayerUsesStageMusic
+      releaseMediaPlayer()
+      if (shouldFallbackToTick) prepareStageAudio(stageIndex, useStageMusic = false)
+    }
+  }
+
+  private fun pauseStageAudio() {
+    if (!mediaPlayerPrepared) return
+    runCatching {
+      mediaPlayer?.takeIf(MediaPlayer::isPlaying)?.pause()
+    }
+  }
+
+  private fun releaseMediaPlayer() {
+    val currentPlayer = mediaPlayer
+    mediaPlayer = null
+    mediaPlayerStageIndex = null
+    mediaPlayerUsesStageMusic = false
+    mediaPlayerPrepared = false
+    runCatching {
+      currentPlayer?.reset()
+      currentPlayer?.release()
+    }
+  }
+
+  private fun stopStageSequence() {
+    interruptSpeech()
+    releaseMediaPlayer()
+    stageIntroPending = false
+  }
+
+  private fun interruptSpeech() {
+    pendingSpeech = null
+    clearSpeech()
+    textToSpeech?.stop()
+  }
+
+  private fun clearSpeech() {
+    activeSpeechId = null
+    activeSpeechStageIndex = null
   }
 
   private fun vibrate() {
@@ -435,12 +681,10 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
     .build()
 
-  private fun controlBackgroundAudio(action: String) {
-    val intent = Intent()
-      .setClassName(packageName, "expo.modules.audio.service.AudioControlsService")
-      .setAction(action)
-    startService(intent)
-  }
+  private fun playbackAudioAttributes() = AudioAttributes.Builder()
+    .setUsage(AudioAttributes.USAGE_MEDIA)
+    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+    .build()
 
   companion object {
     const val ACTION_START = "expo.modules.rhythmworkouttimer.START"
@@ -453,15 +697,18 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
     private const val EXTRA_PLAN_TITLE = "planTitle"
     private const val EXTRA_STAGE_NAMES = "stageNames"
     private const val EXTRA_STAGE_CUES = "stageCues"
+    private const val EXTRA_STAGE_MUSIC_NAMES = "stageMusicNames"
+    private const val EXTRA_STAGE_MUSIC_URIS = "stageMusicUris"
     private const val EXTRA_STAGE_DURATIONS = "stageDurations"
     private const val EXTRA_STAGE_INDEX = "stageIndex"
     private const val EXTRA_REMAINING_MS = "remainingMs"
     private const val EXTRA_VOICE_ENABLED = "voiceEnabled"
     private const val EXTRA_VIBRATION_ENABLED = "vibrationEnabled"
+    private const val EXTRA_VOICE_VOLUME = "voiceVolume"
+    private const val EXTRA_MUSIC_VOLUME = "musicVolume"
+    private const val EXTRA_TICK_URI = "tickUri"
     private const val CHANNEL_ID = "rhythm-workout-timer"
     private const val NOTIFICATION_ID = 7_421
-    private const val EXPO_AUDIO_ACTION_PLAY = "expo.modules.audio.action.PLAY"
-    private const val EXPO_AUDIO_ACTION_PAUSE = "expo.modules.audio.action.PAUSE"
 
     fun createStartIntent(
       context: Context,
@@ -471,18 +718,26 @@ class WorkoutTimerService : Service(), TextToSpeech.OnInitListener {
       stageIndex: Int,
       remainingMs: Long,
       voiceEnabled: Boolean,
-      vibrationEnabled: Boolean
+      vibrationEnabled: Boolean,
+      voiceVolume: Float,
+      musicVolume: Float,
+      tickUri: String?
     ) = Intent(context, WorkoutTimerService::class.java).apply {
       action = ACTION_START
       putExtra(EXTRA_PLAN_ID, planId)
       putExtra(EXTRA_PLAN_TITLE, planTitle)
       putStringArrayListExtra(EXTRA_STAGE_NAMES, ArrayList(stages.map(WorkoutStage::name)))
       putStringArrayListExtra(EXTRA_STAGE_CUES, ArrayList(stages.map(WorkoutStage::cue)))
+      putStringArrayListExtra(EXTRA_STAGE_MUSIC_NAMES, ArrayList(stages.map { it.musicName.orEmpty() }))
+      putStringArrayListExtra(EXTRA_STAGE_MUSIC_URIS, ArrayList(stages.map { it.musicUri.orEmpty() }))
       putExtra(EXTRA_STAGE_DURATIONS, stages.map(WorkoutStage::durationMs).toLongArray())
       putExtra(EXTRA_STAGE_INDEX, stageIndex)
       putExtra(EXTRA_REMAINING_MS, remainingMs)
       putExtra(EXTRA_VOICE_ENABLED, voiceEnabled)
       putExtra(EXTRA_VIBRATION_ENABLED, vibrationEnabled)
+      putExtra(EXTRA_VOICE_VOLUME, voiceVolume.coerceIn(0f, 1f))
+      putExtra(EXTRA_MUSIC_VOLUME, musicVolume.coerceIn(0f, 1f))
+      putExtra(EXTRA_TICK_URI, tickUri)
     }
   }
 }

@@ -3,12 +3,12 @@ export type Stage = {
   name: string;
   durationSec: number;
   cue?: string;
+  music?: MusicSelection;
 };
 
 export type MusicSelection = {
   name: string;
   uri: string;
-  volume?: number;
 };
 
 export type RhythmPlan = {
@@ -18,7 +18,6 @@ export type RhythmPlan = {
   emoji: string;
   accent: string;
   stages: Stage[];
-  music?: MusicSelection;
   updatedAt: number;
 };
 

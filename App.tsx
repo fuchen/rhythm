@@ -34,12 +34,13 @@ import {
 } from 'react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { starterPlans } from './src/defaults';
-import { formatClock, formatDuration, planDuration, RhythmPlan, Screen, Stage } from './src/models';
+import { formatClock, formatDuration, MusicSelection, planDuration, RhythmPlan, Screen, Stage } from './src/models';
 
-const STORAGE_KEY = '@rhythm/plans-v1';
+const LEGACY_STORAGE_KEY = '@rhythm/plans-v1';
+const STORAGE_KEY = '@rhythm/plans-v2';
 const SETTINGS_KEY = '@rhythm/settings-v1';
 const DEFAULT_MUSIC_VOLUME = 0.7;
-const SPEECH_MUSIC_VOLUME_RATIO = 0.15;
+const DEFAULT_VOICE_VOLUME = 1;
 const DURATION_WHEEL_ROW_HEIGHT = 54;
 const DEFAULT_MAX_DURATION_MINUTES = 60;
 const CIRCULAR_WHEEL_COPIES = 5;
@@ -48,12 +49,24 @@ type Settings = {
   voiceEnabled: boolean;
   vibrationEnabled: boolean;
   largeText: boolean;
+  voiceVolume: number;
+  musicVolume: number;
+};
+
+type SettingsUpdater = <Key extends keyof Settings>(key: Key, value: Settings[Key]) => void;
+
+type LegacyMusicSelection = MusicSelection & { volume?: number };
+type LegacyRhythmPlan = Omit<RhythmPlan, 'stages'> & {
+  stages: Array<Omit<Stage, 'music'> & { music?: LegacyMusicSelection }>;
+  music?: LegacyMusicSelection;
 };
 
 const defaultSettings: Settings = {
   voiceEnabled: true,
   vibrationEnabled: true,
   largeText: false,
+  voiceVolume: DEFAULT_VOICE_VOLUME,
+  musicVolume: DEFAULT_MUSIC_VOLUME,
 };
 
 const colors = {
@@ -72,7 +85,22 @@ const colors = {
 };
 
 const makeId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-const clampMusicVolume = (value: number) => Math.min(1, Math.max(0, Math.round(value * 10) / 10));
+const clampVolume = (value: number) => Math.min(1, Math.max(0, Math.round(value * 10) / 10));
+
+const normalizeMusic = (music?: LegacyMusicSelection): MusicSelection | undefined =>
+  music?.name && music.uri ? { name: music.name, uri: music.uri } : undefined;
+
+const migratePlans = (plans: LegacyRhythmPlan[]): RhythmPlan[] => plans.map((plan) => {
+  const legacyMusic = normalizeMusic(plan.music);
+  const { music: _legacyMusic, ...currentPlan } = plan;
+  return {
+    ...currentPlan,
+    stages: plan.stages.map((stage) => ({
+      ...stage,
+      music: normalizeMusic(stage.music) ?? legacyMusic,
+    })),
+  };
+});
 
 export default function App() {
   const [plans, setPlans] = useState<RhythmPlan[]>(starterPlans);
@@ -90,17 +118,24 @@ export default function App() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [savedPlans, savedSettings] = await Promise.all([
+        const [savedPlans, legacyPlans, savedSettings] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEY),
+          AsyncStorage.getItem(LEGACY_STORAGE_KEY),
           AsyncStorage.getItem(SETTINGS_KEY),
         ]);
-        if (savedPlans) {
-          const parsed = JSON.parse(savedPlans) as RhythmPlan[];
-          if (Array.isArray(parsed) && parsed.length > 0) setPlans(parsed);
+        const storedPlans = savedPlans ?? legacyPlans;
+        if (storedPlans) {
+          const parsed = JSON.parse(storedPlans) as LegacyRhythmPlan[];
+          if (Array.isArray(parsed) && parsed.length > 0) setPlans(migratePlans(parsed));
         }
         if (savedSettings) {
           const parsed = JSON.parse(savedSettings) as Partial<Settings>;
-          setSettings({ ...defaultSettings, ...parsed });
+          setSettings({
+            ...defaultSettings,
+            ...parsed,
+            voiceVolume: clampVolume(parsed.voiceVolume ?? DEFAULT_VOICE_VOLUME),
+            musicVolume: clampVolume(parsed.musicVolume ?? DEFAULT_MUSIC_VOLUME),
+          });
         }
       } catch {
         // The starter plans remain available when local data cannot be read.
@@ -329,7 +364,7 @@ function EditorScreen({
   const [newStageName, setNewStageName] = useState('');
   const [newStageDurationSec, setNewStageDurationSec] = useState(120);
   const [durationPicker, setDurationPicker] = useState<{ stageId: string | null; seconds: number } | null>(null);
-  const [musicImporting, setMusicImporting] = useState(false);
+  const [musicImportingStageId, setMusicImportingStageId] = useState<string | null>(null);
   const total = planDuration(plan);
 
   const addStage = () => {
@@ -361,6 +396,29 @@ function EditorScreen({
       setNewStageDurationSec(seconds);
     }
     setDurationPicker(null);
+  };
+
+  const chooseStageMusic = async (stageId: string) => {
+    const result = await getDocumentAsync({ type: '*/*', copyToCacheDirectory: true, multiple: false });
+    const asset = !result.canceled ? result.assets?.[0] : undefined;
+    if (!asset) return;
+
+    setMusicImportingStageId(stageId);
+    try {
+      const selectedMusic = isMidiFile(asset.name, asset.mimeType)
+        ? await convertMidiToWav(asset.uri, asset.name)
+        : { name: asset.name, uri: asset.uri };
+      onUpdate((current) => ({
+        ...current,
+        updatedAt: Date.now(),
+        stages: current.stages.map((stage) => stage.id === stageId ? { ...stage, music: selectedMusic } : stage),
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无法读取这个音频文件。';
+      Alert.alert(isMidiFile(asset.name, asset.mimeType) ? 'MIDI 导入失败' : '音乐导入失败', message);
+    } finally {
+      setMusicImportingStageId(null);
+    }
   };
 
   return (
@@ -411,6 +469,14 @@ function EditorScreen({
                   onUpdate((current) => ({ ...current, updatedAt: Date.now(), stages: current.stages.filter((item) => item.id !== stage.id) }));
                 }}
                 onChangeName={(name) => onUpdate((current) => ({ ...current, updatedAt: Date.now(), stages: current.stages.map((item) => item.id === stage.id ? { ...item, name } : item) }))}
+                onChooseMusic={() => void chooseStageMusic(stage.id)}
+                onRemoveMusic={() => onUpdate((current) => ({
+                  ...current,
+                  updatedAt: Date.now(),
+                  stages: current.stages.map((item) => item.id === stage.id ? { ...item, music: undefined } : item),
+                }))}
+                musicImporting={musicImportingStageId === stage.id}
+                musicActionsDisabled={musicImportingStageId !== null}
               />
             ))}
           </View>
@@ -426,67 +492,6 @@ function EditorScreen({
               <Pressable style={styles.addStageButton} onPress={addStage} accessibilityLabel="添加阶段"><Text style={styles.addStageButtonText}>＋</Text></Pressable>
             </View>
           </View>
-
-          <View style={styles.musicCard}>
-            <View style={styles.musicIcon}><Text>🎵</Text></View>
-            <View style={styles.musicCopy}>
-              <Text style={styles.musicTitle}>背景音乐</Text>
-            <Text style={styles.musicSubtitle}>{plan.music?.name ?? '支持 MP3、WAV 和 MIDI 文件'}</Text>
-            </View>
-            <View style={styles.musicActions}>
-              <Pressable style={styles.musicButton} disabled={musicImporting} onPress={async () => {
-                const result = await getDocumentAsync({ type: '*/*', copyToCacheDirectory: true, multiple: false });
-                const asset = !result.canceled ? result.assets?.[0] : undefined;
-                if (!asset) return;
-                if (isMidiFile(asset.name, asset.mimeType)) {
-                  try {
-                    setMusicImporting(true);
-                    const converted = await convertMidiToWav(asset.uri, asset.name);
-                    onUpdate((current) => ({ ...current, updatedAt: Date.now(), music: { name: converted.name, uri: converted.uri, volume: current.music?.volume ?? DEFAULT_MUSIC_VOLUME } }));
-                  } catch (error) {
-                    const message = error instanceof Error ? error.message : '无法读取这个 MIDI 文件。';
-                    Alert.alert('MIDI 导入失败', message);
-                  } finally {
-                    setMusicImporting(false);
-                  }
-                  return;
-                }
-                onUpdate((current) => ({ ...current, updatedAt: Date.now(), music: { name: asset.name, uri: asset.uri, volume: current.music?.volume ?? DEFAULT_MUSIC_VOLUME } }));
-              }}>
-                <Text style={styles.musicButtonText}>{musicImporting ? '转换中' : plan.music ? '更换' : '选择'}</Text>
-              </Pressable>
-              {plan.music && (
-                <Pressable
-                  style={[styles.musicButton, styles.musicRemoveButton]}
-                  disabled={musicImporting}
-                  onPress={() => onUpdate((current) => ({ ...current, updatedAt: Date.now(), music: undefined }))}
-                  accessibilityLabel="移除背景音乐"
-                >
-                  <Text style={styles.musicRemoveButtonText}>移除</Text>
-                </Pressable>
-              )}
-            </View>
-          </View>
-          {plan.music && (
-            <View style={styles.musicVolumeRow}>
-              <Text style={styles.musicVolumeLabel}>音乐音量</Text>
-              <Pressable
-                style={styles.musicVolumeButton}
-                onPress={() => onUpdate((current) => current.music ? ({ ...current, updatedAt: Date.now(), music: { ...current.music, volume: clampMusicVolume((current.music.volume ?? DEFAULT_MUSIC_VOLUME) - 0.1) } }) : current)}
-                accessibilityLabel="降低音乐音量"
-              >
-                <Text style={styles.musicVolumeButtonText}>−</Text>
-              </Pressable>
-              <Text style={styles.musicVolumeValue}>{Math.round((plan.music.volume ?? DEFAULT_MUSIC_VOLUME) * 100)}%</Text>
-              <Pressable
-                style={styles.musicVolumeButton}
-                onPress={() => onUpdate((current) => current.music ? ({ ...current, updatedAt: Date.now(), music: { ...current.music, volume: clampMusicVolume((current.music.volume ?? DEFAULT_MUSIC_VOLUME) + 0.1) } }) : current)}
-                accessibilityLabel="提高音乐音量"
-              >
-                <Text style={styles.musicVolumeButtonText}>＋</Text>
-              </Pressable>
-            </View>
-          )}
 
           <Pressable style={styles.primaryButtonLarge} onPress={onStart}>
             <Text style={styles.primaryButtonLargeText}>开始这个计划</Text>
@@ -509,59 +514,144 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   const [status, setStatus] = useState<'idle' | 'running' | 'paused' | 'complete'>('idle');
   const [stageIndex, setStageIndex] = useState(0);
   const [remaining, setRemaining] = useState(plan.stages[0]?.durationSec ?? 0);
-  const [speechActive, setSpeechActive] = useState(false);
   const [tickUri, setTickUri] = useState<string | null>(null);
   const [nativeTimerEnabled, setNativeTimerEnabled] = useState(hasNativeWorkoutTimer);
+  const [stageAudioBlocked, setStageAudioBlocked] = useState(true);
+  const [foregroundAudioUri, setForegroundAudioUri] = useState<string | null>(null);
+  const [foregroundAudioIsMusic, setForegroundAudioIsMusic] = useState(false);
   const endAtRef = useRef(0);
   const statusRef = useRef(status);
   const stageIndexRef = useRef(0);
   const speechTokenRef = useRef(0);
-  const musicUri = plan.music?.uri ?? null;
-  const musicVolume = clampMusicVolume(plan.music?.volume ?? DEFAULT_MUSIC_VOLUME);
-  const player = useAudioPlayer(musicUri, { updateInterval: 500, keepAudioSessionActive: true });
-  const tickPlayer = useAudioPlayer(tickUri, { updateInterval: 500, keepAudioSessionActive: true });
+  const speechActiveRef = useRef(false);
+  const replayIntroOnResumeRef = useRef(false);
+  const player = useAudioPlayer(null, { updateInterval: 500, keepAudioSessionActive: true });
   const playerStatus = useAudioPlayerStatus(player);
-  const tickPlayerStatus = useAudioPlayerStatus(tickPlayer);
   const currentStage = plan.stages[stageIndex];
   const total = planDuration(plan);
   const completedBefore = plan.stages.slice(0, stageIndex).reduce((sum, stage) => sum + stage.durationSec, 0);
   const progress = Math.min(1, total === 0 ? 0 : (completedBefore + currentStage.durationSec - remaining) / total);
 
-  const setSpeechActiveState = useCallback((active: boolean) => {
-    setSpeechActive(active);
+  const setSpeechActive = useCallback((active: boolean) => {
+    speechActiveRef.current = active;
   }, []);
 
-  const stopSpeech = useCallback(() => {
+  const stopForegroundSpeech = useCallback((blockAudio: boolean) => {
+    const wasActive = speechActiveRef.current;
     speechTokenRef.current += 1;
-    setSpeechActiveState(false);
+    setSpeechActive(false);
+    if (blockAudio) setStageAudioBlocked(true);
     void Speech.stop();
-  }, [setSpeechActiveState]);
+    return wasActive;
+  }, [setSpeechActive]);
 
-  const announce = useCallback((text: string) => {
-    stopSpeech();
-    if (settings.voiceEnabled) {
-      const speechToken = speechTokenRef.current + 1;
-      speechTokenRef.current = speechToken;
-      setSpeechActiveState(true);
-      const finishSpeech = () => {
-        if (speechTokenRef.current !== speechToken) return;
-        setSpeechActiveState(false);
-      };
-      try {
-        Speech.speak(text, {
-          language: 'zh-CN',
-          rate: 0.88,
-          volume: 1,
-          onDone: finishSpeech,
-          onError: finishSpeech,
-          onStopped: finishSpeech,
-        });
-      } catch {
-        finishSpeech();
-      }
+  const prepareForegroundStageSource = useCallback((nextStageIndex: number, readyTickUri: string | null = tickUri) => {
+    const stage = plan.stages[nextStageIndex];
+    const selectedMusicUri = stage.music?.uri ?? null;
+    let nextAudioUri = selectedMusicUri ?? readyTickUri;
+    let nextAudioIsMusic = selectedMusicUri !== null;
+
+    player.pause();
+    player.setActiveForLockScreen(false);
+    try {
+      player.replace(nextAudioUri);
+    } catch {
+      nextAudioUri = readyTickUri;
+      nextAudioIsMusic = false;
+      player.replace(nextAudioUri);
     }
+    player.loop = true;
+    player.volume = nextAudioIsMusic ? clampVolume(settings.musicVolume) : 1;
+    setForegroundAudioUri(nextAudioUri);
+    setForegroundAudioIsMusic(nextAudioIsMusic);
+  }, [plan.stages, player, settings.musicVolume, tickUri]);
+
+  const beginForegroundStage = useCallback(async (nextStageIndex: number, text: string, readyTickUri: string | null = tickUri) => {
+    const speechToken = speechTokenRef.current + 1;
+    speechTokenRef.current = speechToken;
+    setSpeechActive(false);
+    setStageAudioBlocked(true);
+    replayIntroOnResumeRef.current = false;
+    prepareForegroundStageSource(nextStageIndex, readyTickUri);
+    try {
+      await Speech.stop();
+    } catch {}
+    if (speechTokenRef.current !== speechToken) return;
+
     if (settings.vibrationEnabled) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-  }, [setSpeechActiveState, settings.vibrationEnabled, settings.voiceEnabled, stopSpeech]);
+    if (!settings.voiceEnabled) {
+      setStageAudioBlocked(false);
+      return;
+    }
+
+    const finishSpeech = () => {
+      if (speechTokenRef.current !== speechToken) return;
+      setSpeechActive(false);
+      setStageAudioBlocked(false);
+    };
+    setSpeechActive(true);
+    try {
+      Speech.speak(text, {
+        language: 'zh-CN',
+        rate: 0.88,
+        volume: clampVolume(settings.voiceVolume),
+        onDone: finishSpeech,
+        onError: finishSpeech,
+        onStopped: finishSpeech,
+      });
+    } catch {
+      finishSpeech();
+    }
+  }, [prepareForegroundStageSource, setSpeechActive, settings.vibrationEnabled, settings.voiceEnabled, settings.voiceVolume, tickUri]);
+
+  const announceForegroundCompletion = useCallback(async () => {
+    const speechToken = speechTokenRef.current + 1;
+    speechTokenRef.current = speechToken;
+    setSpeechActive(false);
+    setStageAudioBlocked(true);
+    replayIntroOnResumeRef.current = false;
+    player.pause();
+    player.setActiveForLockScreen(false);
+    player.replace(null);
+    setForegroundAudioUri(null);
+    setForegroundAudioIsMusic(false);
+    try {
+      await Speech.stop();
+    } catch {}
+    if (speechTokenRef.current !== speechToken) return;
+
+    if (settings.vibrationEnabled) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    if (!settings.voiceEnabled) return;
+
+    const finishSpeech = () => {
+      if (speechTokenRef.current === speechToken) setSpeechActive(false);
+    };
+    setSpeechActive(true);
+    try {
+      Speech.speak('训练完成，做得很好！', {
+        language: 'zh-CN',
+        rate: 0.88,
+        volume: clampVolume(settings.voiceVolume),
+        onDone: finishSpeech,
+        onError: finishSpeech,
+        onStopped: finishSpeech,
+      });
+    } catch {
+      finishSpeech();
+    }
+  }, [player, setSpeechActive, settings.vibrationEnabled, settings.voiceEnabled, settings.voiceVolume]);
+
+  const stopForegroundPlayback = useCallback(() => {
+    stopForegroundSpeech(true);
+    replayIntroOnResumeRef.current = false;
+    player.pause();
+    player.setActiveForLockScreen(false);
+    try {
+      player.replace(null);
+    } catch {}
+    setForegroundAudioUri(null);
+    setForegroundAudioIsMusic(false);
+  }, [player, stopForegroundSpeech]);
 
   const setWorkoutStatus = useCallback((nextStatus: 'idle' | 'running' | 'paused' | 'complete') => {
     statusRef.current = nextStatus;
@@ -583,7 +673,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     if (now >= nextEndAt) {
       setRemaining(0);
       setWorkoutStatus('complete');
-      announce('训练完成，做得很好！');
+      void announceForegroundCompletion();
       return;
     }
 
@@ -594,9 +684,9 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
       stageIndexRef.current = nextStageIndex;
       setStageIndex(nextStageIndex);
       const nextStage = plan.stages[nextStageIndex];
-      announce(`接下来，${nextStage.name}。${nextStage.cue ?? ''}`);
+      void beginForegroundStage(nextStageIndex, `接下来，${nextStage.name}。${nextStage.cue ?? ''}`);
     }
-  }, [announce, plan.stages, setWorkoutStatus]);
+  }, [announceForegroundCompletion, beginForegroundStage, plan.stages, setWorkoutStatus]);
 
   const syncNativeWorkoutClock = useCallback(async () => {
     if (!nativeTimerEnabled) return;
@@ -617,38 +707,41 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   useEffect(() => {
     void setAudioModeAsync({ playsInSilentMode: true, interruptionMode: 'doNotMix', shouldPlayInBackground: true });
     void ensureTickSoundAsync().then(setTickUri).catch(() => setTickUri(null));
-    return stopSpeech;
-  }, [stopSpeech]);
+    return () => {
+      speechTokenRef.current += 1;
+      void Speech.stop();
+      player.pause();
+      player.setActiveForLockScreen(false);
+    };
+  }, [player]);
 
   useEffect(() => {
-    if (!musicUri) return;
+    if (nativeTimerEnabled) {
+      player.pause();
+      player.setActiveForLockScreen(false);
+      return;
+    }
+
     player.loop = true;
-    if (status === 'running') {
+    player.volume = foregroundAudioIsMusic ? clampVolume(settings.musicVolume) : 1;
+    if (status === 'running' && !stageAudioBlocked && foregroundAudioUri) {
       player.setActiveForLockScreen(true, { title: currentStage.name, artist: plan.title }, { showSeekForward: false, showSeekBackward: false });
-      player.play();
+      if (!player.playing) player.play();
     } else {
       player.pause();
+      player.setActiveForLockScreen(false);
     }
-  }, [currentStage.name, musicUri, plan.title, player, status]);
+  }, [currentStage.name, foregroundAudioIsMusic, foregroundAudioUri, nativeTimerEnabled, plan.title, player, settings.musicVolume, stageAudioBlocked, status]);
 
   useEffect(() => {
-    if (!musicUri) return;
-    player.volume = musicVolume * (speechActive ? SPEECH_MUSIC_VOLUME_RATIO : 1);
-  }, [musicUri, musicVolume, player, speechActive]);
-
-  useEffect(() => {
-    tickPlayer.volume = speechActive ? 0 : 1;
-    tickPlayer.loop = true;
-    const shouldRunTick = status === 'running' && !musicUri && Boolean(tickUri);
-    if (!shouldRunTick) {
-      tickPlayer.pause();
-      if (tickUri) tickPlayer.setActiveForLockScreen(false);
-      return undefined;
-    }
-    tickPlayer.setActiveForLockScreen(true, { title: currentStage.name, artist: plan.title }, { showSeekForward: false, showSeekBackward: false });
-    if (!tickPlayer.playing) tickPlayer.play();
-    return undefined;
-  }, [currentStage.name, musicUri, plan.title, speechActive, status, tickPlayer, tickUri]);
+    if (nativeTimerEnabled || !foregroundAudioIsMusic || !playerStatus.error || !tickUri) return;
+    player.pause();
+    player.replace(tickUri);
+    player.loop = true;
+    player.volume = 1;
+    setForegroundAudioUri(tickUri);
+    setForegroundAudioIsMusic(false);
+  }, [foregroundAudioIsMusic, nativeTimerEnabled, player, playerStatus.error, tickUri]);
 
   useEffect(() => {
     if (nativeTimerEnabled || status !== 'running') return undefined;
@@ -664,11 +757,9 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     return () => clearInterval(timer);
   }, [nativeTimerEnabled, status, syncNativeWorkoutClock]);
 
-  const audioHeartbeat = musicUri ? playerStatus.currentTime : tickPlayerStatus.currentTime;
-
   useEffect(() => {
     if (!nativeTimerEnabled) syncWorkoutClock();
-  }, [audioHeartbeat, nativeTimerEnabled, syncWorkoutClock]);
+  }, [nativeTimerEnabled, playerStatus.currentTime, syncWorkoutClock]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextAppState) => {
@@ -687,29 +778,51 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
         // Notification controls are optional; the workout still starts if permission is unavailable.
       }
     }
+    let readyTickUri = tickUri;
+    if (!readyTickUri) {
+      try {
+        readyTickUri = await ensureTickSoundAsync();
+        setTickUri(readyTickUri);
+      } catch {
+        readyTickUri = null;
+      }
+    }
+
     endAtRef.current = Date.now() + remaining * 1000;
     setWorkoutStatus('running');
+    const activeStageIndex = stageIndexRef.current;
+    const activeStage = plan.stages[activeStageIndex];
     if (nativeTimerEnabled) {
-      void startNativeWorkoutTimer(plan, stageIndexRef.current, remaining, settings).catch(() => {
+      try {
+        await startNativeWorkoutTimer(plan, activeStageIndex, remaining, settings, readyTickUri);
+        return;
+      } catch {
         setNativeTimerEnabled(false);
-        announce(`开始${currentStage.name}，${currentStage.cue ?? ''}`);
-      });
-    } else {
-      announce(`开始${currentStage.name}，${currentStage.cue ?? ''}`);
+      }
     }
+    await beginForegroundStage(activeStageIndex, `开始${activeStage.name}，${activeStage.cue ?? ''}`, readyTickUri);
   };
 
   const pause = () => {
     setRemaining(Math.max(0, Math.ceil((endAtRef.current - Date.now()) / 1000)));
     setWorkoutStatus('paused');
-    stopSpeech();
-    if (nativeTimerEnabled) void pauseNativeWorkoutTimer();
+    if (nativeTimerEnabled) {
+      void pauseNativeWorkoutTimer();
+    } else {
+      replayIntroOnResumeRef.current = stopForegroundSpeech(speechActiveRef.current);
+    }
   };
 
   const resume = () => {
     endAtRef.current = Date.now() + remaining * 1000;
     setWorkoutStatus('running');
-    if (nativeTimerEnabled) void resumeNativeWorkoutTimer();
+    if (nativeTimerEnabled) {
+      void resumeNativeWorkoutTimer();
+    } else if (replayIntroOnResumeRef.current) {
+      const activeStageIndex = stageIndexRef.current;
+      const activeStage = plan.stages[activeStageIndex];
+      void beginForegroundStage(activeStageIndex, `继续${activeStage.name}，${activeStage.cue ?? ''}`);
+    }
   };
 
   const skip = () => {
@@ -720,14 +833,20 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
       setStageIndex(nextStageIndex);
       setRemaining(nextStage.durationSec);
       endAtRef.current = Date.now() + nextStage.durationSec * 1000;
-      if (nativeTimerEnabled) void skipNativeWorkoutStage();
-      else announce(`跳到${nextStage.name}。${nextStage.cue ?? ''}`);
+      if (nativeTimerEnabled) {
+        void skipNativeWorkoutStage();
+      } else if (statusRef.current === 'paused') {
+        stopForegroundSpeech(true);
+        replayIntroOnResumeRef.current = true;
+      } else {
+        void beginForegroundStage(nextStageIndex, `跳到${nextStage.name}。${nextStage.cue ?? ''}`);
+      }
       return;
     }
     setWorkoutStatus('complete');
     setRemaining(0);
     if (nativeTimerEnabled) void skipNativeWorkoutStage();
-    else announce('训练完成，做得很好！');
+    else void announceForegroundCompletion();
   };
 
   const reset = () => {
@@ -735,13 +854,13 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     stageIndexRef.current = 0;
     setStageIndex(0);
     setRemaining(plan.stages[0]?.durationSec ?? 0);
-    stopSpeech();
+    stopForegroundPlayback();
     if (nativeTimerEnabled) void resetNativeWorkoutTimer();
   };
 
   const exitWorkout = () => {
     if (nativeTimerEnabled) void resetNativeWorkoutTimer();
-    stopSpeech();
+    stopForegroundPlayback();
     onBack();
   };
 
@@ -790,7 +909,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   );
 }
 
-function SettingsScreen({ settings, onBack, onChange }: { settings: Settings; onBack: () => void; onChange: (key: keyof Settings, value: boolean) => void }) {
+function SettingsScreen({ settings, onBack, onChange }: { settings: Settings; onBack: () => void; onChange: SettingsUpdater }) {
   return (
     <ScreenContainer>
       <Header title="设置" onBack={onBack} />
@@ -801,6 +920,24 @@ function SettingsScreen({ settings, onBack, onChange }: { settings: Settings; on
           <SettingRow icon="🔊" title="语音提示" description="播报当前和下一阶段" value={settings.voiceEnabled} onValueChange={(value) => onChange('voiceEnabled', value)} />
           <SettingRow icon="📳" title="震动提醒" description="阶段切换时轻轻震动" value={settings.vibrationEnabled} onValueChange={(value) => onChange('vibrationEnabled', value)} />
           <SettingRow icon="Aa" title="大字体模式" description="让运动界面的数字更醒目" value={settings.largeText} onValueChange={(value) => onChange('largeText', value)} last />
+        </View>
+        <Text style={styles.settingsSectionTitle}>播放音量</Text>
+        <View style={styles.settingsCard}>
+          <VolumeSettingRow
+            icon="🗣"
+            title="语音音量"
+            description="阶段播报和完成提醒"
+            value={settings.voiceVolume}
+            onValueChange={(value) => onChange('voiceVolume', value)}
+          />
+          <VolumeSettingRow
+            icon="🎵"
+            title="音乐音量"
+            description="所有阶段的背景音乐"
+            value={settings.musicVolume}
+            onValueChange={(value) => onChange('musicVolume', value)}
+            last
+          />
         </View>
         <View style={styles.aboutCard}><Text style={styles.aboutEmoji}>🌿</Text><View style={styles.aboutCopy}><Text style={styles.aboutTitle}>节奏伴侣 1.0.2</Text><Text style={styles.aboutText}>为家人设计的简单运动计时器。数据只保存在这台手机上。</Text></View></View>
       </ScrollView>
@@ -814,6 +951,35 @@ function SettingRow({ icon, title, description, value, onValueChange, last }: { 
       <View style={styles.settingIcon}><Text style={styles.settingIconText}>{icon}</Text></View>
       <View style={styles.settingCopy}><Text style={styles.settingTitle}>{title}</Text><Text style={styles.settingDescription}>{description}</Text></View>
       <Switch value={value} onValueChange={onValueChange} trackColor={{ false: '#D7E1DC', true: colors.greenSoft }} thumbColor={value ? colors.green : '#FFFFFF'} accessibilityLabel={title} />
+    </View>
+  );
+}
+
+function VolumeSettingRow({ icon, title, description, value, onValueChange, last }: { icon: string; title: string; description: string; value: number; onValueChange: (value: number) => void; last?: boolean }) {
+  const percentage = Math.round(clampVolume(value) * 100);
+  return (
+    <View style={[styles.settingRow, !last && styles.settingRowBorder]}>
+      <View style={styles.settingIcon}><Text style={styles.settingIconText}>{icon}</Text></View>
+      <View style={styles.settingCopy}><Text style={styles.settingTitle}>{title}</Text><Text style={styles.settingDescription}>{description}</Text></View>
+      <View style={styles.volumeControls}>
+        <Pressable
+          style={[styles.volumeButton, percentage === 0 && styles.volumeButtonDisabled]}
+          disabled={percentage === 0}
+          onPress={() => onValueChange(clampVolume(value - 0.1))}
+          accessibilityLabel={`降低${title}`}
+        >
+          <Text style={styles.volumeButtonText}>−</Text>
+        </Pressable>
+        <Text style={styles.volumeValue}>{percentage}%</Text>
+        <Pressable
+          style={[styles.volumeButton, percentage === 100 && styles.volumeButtonDisabled]}
+          disabled={percentage === 100}
+          onPress={() => onValueChange(clampVolume(value + 0.1))}
+          accessibilityLabel={`提高${title}`}
+        >
+          <Text style={styles.volumeButtonText}>＋</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -912,19 +1078,65 @@ function DurationWheelColumn({ visible, values, selectedValue, resetValue, suffi
   );
 }
 
-function StageEditorRow({ stage, index, isLast, onEditDuration, onDelete, onChangeName }: { stage: Stage; index: number; isLast: boolean; onEditDuration: () => void; onDelete: () => void; onChangeName: (name: string) => void }) {
+function StageEditorRow({
+  stage,
+  index,
+  isLast,
+  onEditDuration,
+  onDelete,
+  onChangeName,
+  onChooseMusic,
+  onRemoveMusic,
+  musicImporting,
+  musicActionsDisabled,
+}: {
+  stage: Stage;
+  index: number;
+  isLast: boolean;
+  onEditDuration: () => void;
+  onDelete: () => void;
+  onChangeName: (name: string) => void;
+  onChooseMusic: () => void;
+  onRemoveMusic: () => void;
+  musicImporting: boolean;
+  musicActionsDisabled: boolean;
+}) {
   return (
-    <View style={styles.stageEditorRow}>
-      <View style={styles.stageNumber}><Text style={styles.stageNumberText}>{index + 1}</Text></View>
-      <View style={styles.stageEditorCopy}>
-        <TextInput value={stage.name} onChangeText={onChangeName} style={styles.stageNameTextInput} />
-        <Text style={styles.stageCueText}>{stage.cue}</Text>
+    <View style={[styles.stageEditorRow, !isLast && styles.stageEditorRowBorder]}>
+      <View style={styles.stageEditorMain}>
+        <View style={styles.stageNumber}><Text style={styles.stageNumberText}>{index + 1}</Text></View>
+        <View style={styles.stageEditorCopy}>
+          <TextInput value={stage.name} onChangeText={onChangeName} style={styles.stageNameTextInput} />
+          <Text style={styles.stageCueText}>{stage.cue}</Text>
+        </View>
+        <Pressable onPress={onEditDuration} style={styles.stageDurationButton} accessibilityLabel={`设置${stage.name}时长`}>
+          <Text style={styles.stageDuration}>{formatClock(stage.durationSec)}</Text>
+          <Text style={styles.stageDurationHint}>调整</Text>
+        </Pressable>
+        {!isLast && <Pressable onPress={onDelete} style={styles.stageDelete}><Text style={styles.stageDeleteText}>×</Text></Pressable>}
       </View>
-      <Pressable onPress={onEditDuration} style={styles.stageDurationButton} accessibilityLabel={`设置${stage.name}时长`}>
-        <Text style={styles.stageDuration}>{formatClock(stage.durationSec)}</Text>
-        <Text style={styles.stageDurationHint}>调整</Text>
-      </Pressable>
-      {!isLast && <Pressable onPress={onDelete} style={styles.stageDelete}><Text style={styles.stageDeleteText}>×</Text></Pressable>}
+      <View style={styles.stageMusicRow}>
+        <Text style={styles.stageMusicIcon}>🎵</Text>
+        <Text style={styles.stageMusicName} numberOfLines={1}>{stage.music?.name ?? '未选音乐，使用秒针提示音'}</Text>
+        <Pressable
+          style={[styles.stageMusicButton, musicActionsDisabled && styles.stageMusicButtonDisabled]}
+          disabled={musicActionsDisabled}
+          onPress={onChooseMusic}
+          accessibilityLabel={`${stage.name}${stage.music ? '更换' : '选择'}音乐`}
+        >
+          <Text style={styles.stageMusicButtonText}>{musicImporting ? '转换中' : stage.music ? '更换' : '选择'}</Text>
+        </Pressable>
+        {stage.music && (
+          <Pressable
+            style={[styles.stageMusicButton, styles.stageMusicRemoveButton, musicActionsDisabled && styles.stageMusicButtonDisabled]}
+            disabled={musicActionsDisabled}
+            onPress={onRemoveMusic}
+            accessibilityLabel={`${stage.name}移除音乐`}
+          >
+            <Text style={styles.stageMusicRemoveText}>移除</Text>
+          </Pressable>
+        )}
+      </View>
     </View>
   );
 }
@@ -1037,7 +1249,9 @@ const styles = StyleSheet.create({
   sectionTitleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   sectionHint: { color: colors.muted, fontSize: 11 },
   stageList: { backgroundColor: colors.card, borderRadius: 18, borderWidth: 1, borderColor: colors.line, overflow: 'hidden' },
-  stageEditorRow: { minHeight: 75, borderBottomWidth: 1, borderBottomColor: colors.line, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center' },
+  stageEditorRow: { minHeight: 118, paddingHorizontal: 13, paddingVertical: 11 },
+  stageEditorRowBorder: { borderBottomWidth: 1, borderBottomColor: colors.line },
+  stageEditorMain: { flexDirection: 'row', alignItems: 'center' },
   stageNumber: { width: 28, height: 28, borderRadius: 14, backgroundColor: colors.greenSoft, alignItems: 'center', justifyContent: 'center', marginRight: 10 },
   stageNumberText: { color: colors.green, fontSize: 12, fontWeight: '800' },
   stageEditorCopy: { flex: 1, minWidth: 80 },
@@ -1048,6 +1262,14 @@ const styles = StyleSheet.create({
   stageDurationHint: { color: colors.green, fontSize: 9, marginTop: 2 },
   stageDelete: { width: 24, alignItems: 'flex-end', marginLeft: 2 },
   stageDeleteText: { color: '#A9B9B3', fontSize: 22, fontWeight: '300' },
+  stageMusicRow: { minHeight: 34, flexDirection: 'row', alignItems: 'center', marginTop: 8, marginLeft: 38 },
+  stageMusicIcon: { fontSize: 13, marginRight: 6 },
+  stageMusicName: { color: colors.muted, fontSize: 10, flex: 1, marginRight: 6 },
+  stageMusicButton: { minWidth: 44, minHeight: 30, paddingHorizontal: 8, borderRadius: 8, backgroundColor: colors.orangeSoft, alignItems: 'center', justifyContent: 'center' },
+  stageMusicButtonDisabled: { opacity: 0.45 },
+  stageMusicButtonText: { color: colors.orange, fontSize: 10, fontWeight: '800' },
+  stageMusicRemoveButton: { marginLeft: 5, backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#E6B9A7' },
+  stageMusicRemoveText: { color: colors.danger, fontSize: 10, fontWeight: '800' },
   addStageCard: { backgroundColor: colors.card, borderRadius: 18, borderWidth: 1, borderColor: colors.line, padding: 14, marginTop: 12 },
   addStageTitle: { color: colors.ink, fontWeight: '800', fontSize: 14, marginBottom: 10 },
   addStageInputs: { flexDirection: 'row', alignItems: 'center', gap: 8 },
@@ -1061,21 +1283,6 @@ const styles = StyleSheet.create({
   durationPickerSuffix: { color: colors.muted, fontSize: 10, marginTop: 1 },
   addStageButton: { width: 42, height: 42, backgroundColor: colors.green, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   addStageButtonText: { color: '#FFFFFF', fontSize: 23, lineHeight: 25 },
-  musicCard: { backgroundColor: colors.orangeSoft, borderRadius: 17, padding: 13, flexDirection: 'row', alignItems: 'center', marginTop: 12 },
-  musicIcon: { width: 40, height: 40, borderRadius: 13, backgroundColor: '#FFFFFFA8', alignItems: 'center', justifyContent: 'center', marginRight: 10 },
-  musicCopy: { flex: 1 },
-  musicTitle: { color: colors.ink, fontSize: 14, fontWeight: '800' },
-  musicSubtitle: { color: colors.muted, fontSize: 11, marginTop: 3 },
-  musicActions: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  musicButton: { backgroundColor: '#FFFFFF', borderRadius: 9, minWidth: 50, minHeight: 33, justifyContent: 'center', alignItems: 'center' },
-  musicButtonText: { color: colors.orange, fontSize: 12, fontWeight: '800' },
-  musicRemoveButton: { borderWidth: 1, borderColor: '#E6B9A7' },
-  musicRemoveButtonText: { color: colors.danger, fontSize: 12, fontWeight: '800' },
-  musicVolumeRow: { backgroundColor: colors.card, borderRadius: 10, minHeight: 38, paddingHorizontal: 8, flexDirection: 'row', alignItems: 'center', marginTop: 9 },
-  musicVolumeLabel: { color: colors.muted, fontSize: 11, flex: 1 },
-  musicVolumeButton: { width: 28, height: 28, borderRadius: 14, backgroundColor: colors.greenSoft, alignItems: 'center', justifyContent: 'center' },
-  musicVolumeButtonText: { color: colors.green, fontSize: 17, lineHeight: 19 },
-  musicVolumeValue: { color: colors.ink, fontSize: 12, fontWeight: '800', minWidth: 38, textAlign: 'center' },
   durationModalBackdrop: { flex: 1, backgroundColor: '#00000055', justifyContent: 'flex-end' },
   durationModal: { backgroundColor: colors.paper, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingHorizontal: 18, paddingTop: 15, paddingBottom: Platform.OS === 'android' ? 28 : 18 },
   durationModalHeader: { height: 48, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
@@ -1132,6 +1339,7 @@ const styles = StyleSheet.create({
   secondaryButtonText: { color: colors.green, fontWeight: '800' },
   settingsContent: { paddingBottom: 100 },
   settingsCard: { backgroundColor: colors.card, borderRadius: 18, borderWidth: 1, borderColor: colors.line, overflow: 'hidden', marginTop: 22 },
+  settingsSectionTitle: { color: colors.ink, fontSize: 18, fontWeight: '800', marginTop: 25 },
   settingRow: { minHeight: 78, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center' },
   settingRowBorder: { borderBottomWidth: 1, borderBottomColor: colors.line },
   settingIcon: { width: 39, height: 39, borderRadius: 13, backgroundColor: colors.greenSoft, alignItems: 'center', justifyContent: 'center', marginRight: 11 },
@@ -1139,6 +1347,11 @@ const styles = StyleSheet.create({
   settingCopy: { flex: 1 },
   settingTitle: { color: colors.ink, fontWeight: '800', fontSize: 14 },
   settingDescription: { color: colors.muted, fontSize: 12, marginTop: 3 },
+  volumeControls: { flexDirection: 'row', alignItems: 'center', marginLeft: 8 },
+  volumeButton: { width: 30, height: 30, borderRadius: 15, backgroundColor: colors.greenSoft, alignItems: 'center', justifyContent: 'center' },
+  volumeButtonDisabled: { opacity: 0.4 },
+  volumeButtonText: { color: colors.green, fontSize: 18, lineHeight: 20 },
+  volumeValue: { color: colors.ink, fontSize: 12, fontWeight: '800', minWidth: 42, textAlign: 'center' },
   aboutCard: { backgroundColor: colors.yellowSoft, borderRadius: 18, padding: 16, flexDirection: 'row', alignItems: 'center', marginTop: 14 },
   aboutEmoji: { fontSize: 28, marginRight: 12 },
   aboutCopy: { flex: 1 },

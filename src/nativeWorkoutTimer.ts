@@ -16,11 +16,14 @@ type NativeWorkoutTimerModule = {
   start(config: {
     planId: string;
     planTitle: string;
-    stages: Array<{ name: string; cue: string; durationSec: number }>;
+    stages: Array<{ name: string; cue: string; durationSec: number; musicName?: string; musicUri?: string }>;
     stageIndex: number;
     remainingSec: number;
     voiceEnabled: boolean;
     vibrationEnabled: boolean;
+    voiceVolume: number;
+    musicVolume: number;
+    tickUri?: string;
   }): Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
@@ -39,7 +42,8 @@ export function startNativeWorkoutTimer(
   plan: RhythmPlan,
   stageIndex: number,
   remainingSec: number,
-  settings: { voiceEnabled: boolean; vibrationEnabled: boolean }
+  settings: { voiceEnabled: boolean; vibrationEnabled: boolean; voiceVolume: number; musicVolume: number },
+  tickUri: string | null
 ) {
   return nativeModule?.start({
     planId: plan.id,
@@ -48,11 +52,16 @@ export function startNativeWorkoutTimer(
       name: stage.name,
       cue: stage.cue ?? '',
       durationSec: stage.durationSec,
+      musicName: stage.music?.name,
+      musicUri: stage.music?.uri,
     })),
     stageIndex,
     remainingSec,
     voiceEnabled: settings.voiceEnabled,
     vibrationEnabled: settings.vibrationEnabled,
+    voiceVolume: settings.voiceVolume,
+    musicVolume: settings.musicVolume,
+    tickUri: tickUri ?? undefined,
   }) ?? Promise.resolve();
 }
 
