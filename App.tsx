@@ -1,4 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
+import Constants from 'expo-constants';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { getDocumentAsync } from 'expo-document-picker';
@@ -45,6 +46,7 @@ const DEFAULT_VOICE_VOLUME = 1;
 const DURATION_WHEEL_ROW_HEIGHT = 54;
 const DEFAULT_MAX_DURATION_MINUTES = 60;
 const CIRCULAR_WHEEL_COPIES = 5;
+const APP_VERSION = Constants.expoConfig?.version ?? '未知版本';
 
 type Settings = {
   voiceEnabled: boolean;
@@ -1005,7 +1007,7 @@ function SettingsScreen({ settings, onBack, onChange }: { settings: Settings; on
             last
           />
         </View>
-        <View style={styles.aboutCard}><Text style={styles.aboutEmoji}>🌿</Text><View style={styles.aboutCopy}><Text style={styles.aboutTitle}>节奏伴侣 1.0.2</Text><Text style={styles.aboutText}>为家人设计的简单运动计时器。数据只保存在这台手机上。</Text></View></View>
+        <View style={styles.aboutCard}><Text style={styles.aboutEmoji}>🌿</Text><View style={styles.aboutCopy}><Text style={styles.aboutTitle}>节奏伴侣 {APP_VERSION}</Text><Text style={styles.aboutText}>为家人设计的简单运动计时器。数据只保存在这台手机上。</Text></View></View>
       </ScrollView>
     </ScreenContainer>
   );
