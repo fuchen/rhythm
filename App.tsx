@@ -777,8 +777,6 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     return () => {
       speechTokenRef.current += 1;
       void Speech.stop();
-      player.pause();
-      player.setActiveForLockScreen(false);
     };
   }, [player]);
 
