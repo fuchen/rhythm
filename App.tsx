@@ -2,6 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { getDocumentAsync } from 'expo-document-picker';
+import { File, Paths } from 'expo-file-system';
 import { requestNotificationPermissionsAsync, setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { convertMidiToWav, isMidiFile } from './src/midi';
@@ -90,6 +91,32 @@ const clampVolume = (value: number) => Math.min(1, Math.max(0, Math.round(value 
 const normalizeMusic = (music?: LegacyMusicSelection): MusicSelection | undefined =>
   music?.name && music.uri ? { name: music.name, uri: music.uri } : undefined;
 
+const isCacheUri = (uri: string) => uri.startsWith(Paths.cache.uri);
+
+const copyMusicToDocumentAsync = async (uri: string, name: string) => {
+  const extension = name.includes('.') ? name.slice(name.lastIndexOf('.')).replace(/[^a-z0-9.]/gi, '') : '';
+  const destination = new File(Paths.document, `rhythm-music-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extension}`);
+  await new File(uri).copy(destination);
+  return destination.uri;
+};
+
+const persistPlanMusicAsync = async (plans: RhythmPlan[]) => {
+  const migratedPlans = await Promise.all(plans.map(async (plan) => ({
+    ...plan,
+    stages: await Promise.all(plan.stages.map(async (stage) => {
+      if (!stage.music || !isCacheUri(stage.music.uri)) return stage;
+      try {
+        const source = new File(stage.music.uri);
+        if (!source.exists) return stage;
+        return { ...stage, music: { ...stage.music, uri: await copyMusicToDocumentAsync(stage.music.uri, stage.music.name) } };
+      } catch {
+        return stage;
+      }
+    })),
+  })));
+  return migratedPlans;
+};
+
 const migratePlans = (plans: LegacyRhythmPlan[]): RhythmPlan[] => plans.map((plan) => {
   const legacyMusic = normalizeMusic(plan.music);
   const { music: _legacyMusic, ...currentPlan } = plan;
@@ -109,6 +136,9 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>('home');
   const [editReturnScreen, setEditReturnScreen] = useState<Screen>('home');
   const [workoutReturnScreen, setWorkoutReturnScreen] = useState<Screen>('home');
+  const [settingsReturnScreen, setSettingsReturnScreen] = useState<Screen>('home');
+  const [plansStorageReady, setPlansStorageReady] = useState(false);
+  const [settingsStorageReady, setSettingsStorageReady] = useState(false);
   const [activePlanId, setActivePlanId] = useState(starterPlans[0].id);
   const activePlan = useMemo(
     () => plans.find((plan) => plan.id === activePlanId) ?? plans[0],
@@ -117,17 +147,31 @@ export default function App() {
 
   useEffect(() => {
     const load = async () => {
+      let plansLoaded = false;
+      let settingsLoaded = false;
+      let savedSettings: string | null = null;
       try {
-        const [savedPlans, legacyPlans, savedSettings] = await Promise.all([
+        const [savedPlans, legacyPlans, loadedSettings] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEY),
           AsyncStorage.getItem(LEGACY_STORAGE_KEY),
           AsyncStorage.getItem(SETTINGS_KEY),
         ]);
+        savedSettings = loadedSettings;
         const storedPlans = savedPlans ?? legacyPlans;
         if (storedPlans) {
           const parsed = JSON.parse(storedPlans) as LegacyRhythmPlan[];
-          if (Array.isArray(parsed) && parsed.length > 0) setPlans(migratePlans(parsed));
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const migratedPlans = await persistPlanMusicAsync(migratePlans(parsed));
+            setPlans(migratedPlans);
+            plansLoaded = true;
+          }
+        } else {
+          plansLoaded = true;
         }
+      } catch {
+        // Keep the starter plans without overwriting unreadable stored data.
+      }
+      try {
         if (savedSettings) {
           const parsed = JSON.parse(savedSettings) as Partial<Settings>;
           setSettings({
@@ -137,9 +181,12 @@ export default function App() {
             musicVolume: clampVolume(parsed.musicVolume ?? DEFAULT_MUSIC_VOLUME),
           });
         }
+        settingsLoaded = true;
       } catch {
-        // The starter plans remain available when local data cannot be read.
+        // Keep default settings without overwriting unreadable stored data.
       } finally {
+        setPlansStorageReady(plansLoaded);
+        setSettingsStorageReady(settingsLoaded);
         setHydrated(true);
       }
     };
@@ -147,12 +194,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (hydrated) void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(plans));
-  }, [hydrated, plans]);
+    if (hydrated && plansStorageReady) void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(plans));
+  }, [hydrated, plans, plansStorageReady]);
 
   useEffect(() => {
-    if (hydrated) void AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  }, [hydrated, settings]);
+    if (hydrated && settingsStorageReady) void AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }, [hydrated, settings, settingsStorageReady]);
 
   useEffect(() => {
     if (Platform.OS !== 'android') return undefined;
@@ -166,13 +213,13 @@ export default function App() {
         return true;
       }
       if (screen === 'plans' || screen === 'settings') {
-        setScreen('home');
+        setScreen(screen === 'settings' ? settingsReturnScreen : 'home');
         return true;
       }
       return false;
     });
     return () => subscription.remove();
-  }, [editReturnScreen, screen, workoutReturnScreen]);
+  }, [editReturnScreen, screen, settingsReturnScreen, workoutReturnScreen]);
 
   const updatePlan = useCallback((id: string, updater: (plan: RhythmPlan) => RhythmPlan) => {
     setPlans((current) => current.map((plan) => (plan.id === id ? updater(plan) : plan)));
@@ -195,7 +242,7 @@ export default function App() {
           onStart={(plan) => selectPlan(plan, 'workout')}
           onOpenPlan={(plan) => selectPlan(plan)}
           onSeePlans={() => setScreen('plans')}
-          onSettings={() => setScreen('settings')}
+          onSettings={() => { setSettingsReturnScreen('home'); setScreen('settings'); }}
         />
       )}
       {screen === 'plans' && (
@@ -249,17 +296,20 @@ export default function App() {
           plan={activePlan}
           settings={settings}
           onBack={() => setScreen(workoutReturnScreen)}
-          onSettings={() => setScreen('settings')}
+          onSettings={() => { setSettingsReturnScreen('workout'); setScreen('settings'); }}
         />
       )}
       {screen === 'settings' && (
         <SettingsScreen
           settings={settings}
-          onBack={() => setScreen('home')}
+          onBack={() => setScreen(settingsReturnScreen)}
           onChange={(key, value) => setSettings((current) => ({ ...current, [key]: value }))}
         />
       )}
-      {screen !== 'workout' && <BottomNav screen={screen} onNavigate={setScreen} />}
+      {screen !== 'workout' && <BottomNav screen={screen} onNavigate={(nextScreen) => {
+        if (nextScreen === 'settings') setSettingsReturnScreen(screen);
+        setScreen(nextScreen);
+      }} />}
     </View>
   );
 }
@@ -407,7 +457,7 @@ function EditorScreen({
     try {
       const selectedMusic = isMidiFile(asset.name, asset.mimeType)
         ? await convertMidiToWav(asset.uri, asset.name)
-        : { name: asset.name, uri: asset.uri };
+        : { name: asset.name, uri: await copyMusicToDocumentAsync(asset.uri, asset.name) };
       onUpdate((current) => ({
         ...current,
         updatedAt: Date.now(),
@@ -525,6 +575,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   const speechTokenRef = useRef(0);
   const speechActiveRef = useRef(false);
   const replayIntroOnResumeRef = useRef(false);
+  const missingMusicAlertedRef = useRef(new Set<string>());
   const player = useAudioPlayer(null, { updateInterval: 500, keepAudioSessionActive: true });
   const playerStatus = useAudioPlayerStatus(player);
   const currentStage = plan.stages[stageIndex];
@@ -535,6 +586,23 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
   const setSpeechActive = useCallback((active: boolean) => {
     speechActiveRef.current = active;
   }, []);
+
+  const warnMissingMusic = useCallback((nextStageIndex: number) => {
+    const stage = plan.stages[nextStageIndex];
+    const music = stage?.music;
+    if (!music) return false;
+    try {
+      if (new File(music.uri).exists) return false;
+    } catch {
+      // Treat an unreadable URI as unavailable.
+    }
+    const alertKey = `${plan.id}:${stage.id}`;
+    if (!missingMusicAlertedRef.current.has(alertKey)) {
+      missingMusicAlertedRef.current.add(alertKey);
+      Alert.alert('音乐文件无法播放', `“${music.name}”已无法访问，当前阶段将使用秒针提示音。请重新选择音乐。`);
+    }
+    return true;
+  }, [plan.id, plan.stages]);
 
   const stopForegroundSpeech = useCallback((blockAudio: boolean) => {
     const wasActive = speechActiveRef.current;
@@ -547,7 +615,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
 
   const prepareForegroundStageSource = useCallback((nextStageIndex: number, readyTickUri: string | null = tickUri) => {
     const stage = plan.stages[nextStageIndex];
-    const selectedMusicUri = stage.music?.uri ?? null;
+    const selectedMusicUri = stage.music && !warnMissingMusic(nextStageIndex) ? stage.music.uri : null;
     let nextAudioUri = selectedMusicUri ?? readyTickUri;
     let nextAudioIsMusic = selectedMusicUri !== null;
 
@@ -564,7 +632,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     player.volume = nextAudioIsMusic ? clampVolume(settings.musicVolume) : 1;
     setForegroundAudioUri(nextAudioUri);
     setForegroundAudioIsMusic(nextAudioIsMusic);
-  }, [plan.stages, player, settings.musicVolume, tickUri]);
+  }, [plan.stages, player, settings.musicVolume, tickUri, warnMissingMusic]);
 
   const beginForegroundStage = useCallback(async (nextStageIndex: number, text: string, readyTickUri: string | null = tickUri) => {
     const speechToken = speechTokenRef.current + 1;
@@ -612,7 +680,6 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     replayIntroOnResumeRef.current = false;
     player.pause();
     player.setActiveForLockScreen(false);
-    player.replace(null);
     setForegroundAudioUri(null);
     setForegroundAudioIsMusic(false);
     try {
@@ -646,9 +713,6 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     replayIntroOnResumeRef.current = false;
     player.pause();
     player.setActiveForLockScreen(false);
-    try {
-      player.replace(null);
-    } catch {}
     setForegroundAudioUri(null);
     setForegroundAudioIsMusic(false);
   }, [player, stopForegroundSpeech]);
@@ -694,6 +758,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
       const snapshot = await getNativeWorkoutSnapshot();
       if (!snapshot || snapshot.planId !== plan.id || (!snapshot.active && snapshot.status !== 'complete')) return;
       const nextStageIndex = Math.min(Math.max(0, snapshot.stageIndex), plan.stages.length - 1);
+      warnMissingMusic(nextStageIndex);
       stageIndexRef.current = nextStageIndex;
       setStageIndex(nextStageIndex);
       setRemaining(snapshot.remaining);
@@ -702,7 +767,7 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
     } catch {
       setNativeTimerEnabled(false);
     }
-  }, [nativeTimerEnabled, plan.id, plan.stages.length, setWorkoutStatus]);
+  }, [nativeTimerEnabled, plan.id, plan.stages.length, setWorkoutStatus, warnMissingMusic]);
 
   useEffect(() => {
     void setAudioModeAsync({ playsInSilentMode: true, interruptionMode: 'doNotMix', shouldPlayInBackground: true });
@@ -735,13 +800,14 @@ function WorkoutScreen({ plan, settings, onBack, onSettings }: { plan: RhythmPla
 
   useEffect(() => {
     if (nativeTimerEnabled || !foregroundAudioIsMusic || !playerStatus.error || !tickUri) return;
+    Alert.alert('音乐无法播放', `“${currentStage.music?.name ?? '当前音乐'}”无法播放，当前阶段将使用秒针提示音。`);
     player.pause();
     player.replace(tickUri);
     player.loop = true;
     player.volume = 1;
     setForegroundAudioUri(tickUri);
     setForegroundAudioIsMusic(false);
-  }, [foregroundAudioIsMusic, nativeTimerEnabled, player, playerStatus.error, tickUri]);
+  }, [currentStage.music?.name, foregroundAudioIsMusic, nativeTimerEnabled, player, playerStatus.error, tickUri]);
 
   useEffect(() => {
     if (nativeTimerEnabled || status !== 'running') return undefined;
